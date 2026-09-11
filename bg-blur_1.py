@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QDockWidget, QListWidget, QListWidgetItem, QSpinBox, QComboBox,
     QProgressBar, QGroupBox, QCheckBox, QSplitter, QMessageBox,
     QScrollArea, QFrame, QToolButton, QMenu, QSizePolicy, QGraphicsView,
-    QGraphicsScene, QGraphicsPixmapItem, QStyle, QListView
+    QGraphicsScene, QGraphicsPixmapItem, QStyle, QListView, QRubberBand
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF, QSize, QRect
@@ -119,6 +119,8 @@ class ToolMode(Enum):
     PAN = auto()                # パン
     ZOOM = auto()               # ズーム
     NEGATIVE_POINT = auto()     # ネガティブポイント（除外領域）
+    ADD_BOX = auto()            # 範囲選択で追加（ボックスプロンプト）
+    REMOVE_BOX = auto()         # 範囲選択で除外（範囲内にネガティブ点）
 
 
 @dataclass
@@ -406,6 +408,34 @@ def blend_blur(frame, mask_float, blur_type, strength, buf=None, blender=None):
     np.multiply(buf, mask_float[:, :, np.newaxis], out=buf)
     np.add(buf, blurred, out=buf)
     return buf.astype(np.uint8)
+
+
+# SAM2 がボックスを表すのに使うラベル（左上 / 右下）
+BOX_LABEL_TL = 2
+BOX_LABEL_BR = 3
+
+
+def build_prompt_arrays(points):
+    """(x, y, label) の並びを SAM2 に渡す points / labels へ整える
+
+    SAM2 はボックスを「ラベル 2（左上）・3（右下）の 2 点」として扱い、
+    内部では必ず配列の先頭に置く。同じ並びに揃えてから渡す。
+    """
+    box_pts = [p for p in points if int(p[2]) in (BOX_LABEL_TL, BOX_LABEL_BR)]
+    other = [p for p in points if int(p[2]) not in (BOX_LABEL_TL, BOX_LABEL_BR)]
+    ordered = box_pts + other
+    return ([(float(p[0]), float(p[1])) for p in ordered],
+            [int(p[2]) for p in ordered])
+
+
+def extract_boxes(points):
+    """ポイント列からボックスを取り出す → [(x0, y0, x1, y1), ...]"""
+    corners = [p for p in points if int(p[2]) in (BOX_LABEL_TL, BOX_LABEL_BR)]
+    boxes = []
+    for i in range(0, len(corners) - 1, 2):
+        tl, br = corners[i], corners[i + 1]
+        boxes.append((float(tl[0]), float(tl[1]), float(br[0]), float(br[1])))
+    return boxes
 
 
 def sample_points_from_mask(mask, max_points=6, min_area_ratio=0.001):
@@ -1812,6 +1842,7 @@ class FrameViewport(QGraphicsView):
     brush_painted = pyqtSignal(float, float, float)  # x, y, radius
     eraser_painted = pyqtSignal(float, float, float)  # x, y, radius
     stroke_finished = pyqtSignal()                   # ブラシ/消しゴムのドラッグ終了
+    box_selected = pyqtSignal(float, float, float, float, int)  # x0,y0,x1,y1,positive
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1826,6 +1857,8 @@ class FrameViewport(QGraphicsView):
         self._tool_mode = ToolMode.SELECT_PERSON
         self._brush_size = 20
         self._is_painting = False
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._box_origin = None     # ドラッグ開始位置（ビュー座標）
 
         # ビュー設定
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1853,7 +1886,8 @@ class FrameViewport(QGraphicsView):
         self._tool_mode = mode
         if mode == ToolMode.PAN:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
-        elif mode in (ToolMode.ADD_MASK, ToolMode.REMOVE_MASK):
+        elif mode in (ToolMode.ADD_MASK, ToolMode.REMOVE_MASK,
+                      ToolMode.ADD_BOX, ToolMode.REMOVE_BOX):
             self.setCursor(Qt.CursorShape.CrossCursor)
         elif mode == ToolMode.NEGATIVE_POINT:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1904,6 +1938,13 @@ class FrameViewport(QGraphicsView):
             self.eraser_painted.emit(scene_pos.x(), scene_pos.y(), self._brush_size)
             event.accept()
             return
+        elif self._tool_mode in (ToolMode.ADD_BOX, ToolMode.REMOVE_BOX):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._box_origin = event.position().toPoint()
+                self._rubber.setGeometry(QRect(self._box_origin, QSize()))
+                self._rubber.show()
+                event.accept()
+                return
 
         super().mousePressEvent(event)
 
@@ -1917,6 +1958,13 @@ class FrameViewport(QGraphicsView):
             self.verticalScrollBar().setValue(
                 int(self.verticalScrollBar().value() - delta.y())
             )
+            return
+
+        if self._box_origin is not None:
+            self._rubber.setGeometry(
+                QRect(self._box_origin, event.position().toPoint()).normalized()
+            )
+            event.accept()
             return
 
         scene_pos = self.mapToScene(event.position().toPoint())
@@ -1935,6 +1983,19 @@ class FrameViewport(QGraphicsView):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
             else:
                 self.set_tool(self._tool_mode)
+            return
+
+        if self._box_origin is not None:
+            origin, self._box_origin = self._box_origin, None
+            self._rubber.hide()
+            rect = QRect(origin, event.position().toPoint()).normalized()
+            # シーン座標（＝作業解像度の画素座標）へ直す
+            tl = self.mapToScene(rect.topLeft())
+            br = self.mapToScene(rect.bottomRight())
+            positive = 1 if self._tool_mode == ToolMode.ADD_BOX else 0
+            if rect.width() >= 4 and rect.height() >= 4:
+                self.box_selected.emit(tl.x(), tl.y(), br.x(), br.y(), positive)
+            event.accept()
             return
 
         if self._is_painting:
@@ -2196,6 +2257,9 @@ class MainWindow(QMainWindow):
         act_refine = help_menu.addAction("小物がマスクから外れるとき(&R)")
         act_refine.triggered.connect(self._show_refine_help)
 
+        act_box_help = help_menu.addAction("範囲で選ぶ / 除く(&B)")
+        act_box_help.triggered.connect(self._show_box_help)
+
         act_about = help_menu.addAction("バージョン情報")
         act_about.triggered.connect(self._show_about)
 
@@ -2222,6 +2286,8 @@ class MainWindow(QMainWindow):
         tools = [
             ("人物選択 (V)", ToolMode.SELECT_PERSON),
             ("除外ポイント (X)", ToolMode.NEGATIVE_POINT),
+            ("範囲で追加 (R)", ToolMode.ADD_BOX),
+            ("範囲で除外 (Shift+R)", ToolMode.REMOVE_BOX),
             ("ブラシ追加 (B)", ToolMode.ADD_MASK),
             ("消しゴム (E)", ToolMode.REMOVE_MASK),
             ("パン (H)", ToolMode.PAN),
@@ -2306,6 +2372,7 @@ class MainWindow(QMainWindow):
         self.viewport.brush_painted.connect(self._on_brush_paint)
         self.viewport.eraser_painted.connect(self._on_eraser_paint)
         self.viewport.stroke_finished.connect(self._on_stroke_finished)
+        self.viewport.box_selected.connect(self._on_box_selected)
         splitter.addWidget(self.viewport)
 
         # ─── 右サイドパネル ───
@@ -2502,6 +2569,8 @@ class MainWindow(QMainWindow):
         shortcuts = {
             "V": lambda: self._set_tool(ToolMode.SELECT_PERSON),
             "X": lambda: self._set_tool(ToolMode.NEGATIVE_POINT),
+            "R": lambda: self._set_tool(ToolMode.ADD_BOX),
+            "Shift+R": lambda: self._set_tool(ToolMode.REMOVE_BOX),
             "B": lambda: self._set_tool(ToolMode.ADD_MASK),
             "E": lambda: self._set_tool(ToolMode.REMOVE_MASK),
             "H": lambda: self._set_tool(ToolMode.PAN),
@@ -3545,43 +3614,41 @@ class MainWindow(QMainWindow):
         if row >= 0 and row < len(self.state.person_tracks):
             self.current_track_id = self.state.person_tracks[row].track_id
 
-    def _on_point_clicked(self, x, y, label):
-        """ビューポートでポイントがクリックされた"""
+    def _current_track_for_prompt(self):
+        """プロンプトを追加できる状態か確かめ、対象トラックを返す"""
         if not self.state.person_tracks:
             QMessageBox.information(
                 self, "ヒント",
                 "まず「＋ 追加」ボタンで人物トラックを追加してください。"
             )
-            return
-
+            return None
         if not self.sam2.model_loaded:
             QMessageBox.information(
                 self, "ヒント",
                 "まずSAM2モデルをロードしてください。"
             )
-            return
-
-        frame_idx = self.state.current_frame
+            return None
         row = self.person_list.currentRow()
         if row < 0:
             self.statusBar().showMessage("人物トラックが選択されていません")
-            return
-        track = self.state.person_tracks[row]
+            return None
+        return self.state.person_tracks[row]
 
-        # 変更前の状態を控えておき、セグメンテーションが成功したときだけ履歴へ積む
+    def _apply_prompt(self, track, frame_idx, new_entries, label, undo_label):
+        """(x, y, label) を追加してそのフレームを再セグメンテーションする
+
+        new_entries: 追加する [(x, y, label), ...]
+        失敗したら追加を取り消して False を返す。
+        """
         snap = self._capture(
-            "ポイント追加" if label == 1 else "ネガティブポイント追加",
-            mask_slots=[(track.track_id, frame_idx)],
+            undo_label, mask_slots=[(track.track_id, frame_idx)]
         )
 
-        # ポイントを保存
-        if frame_idx not in track.points:
-            track.points[frame_idx] = []
-        track.points[frame_idx].append((x, y, label))
+        existing = track.points.setdefault(frame_idx, [])
+        added = list(new_entries)
+        existing.extend(added)
 
-        # 全ポイントを集める
-        all_pts = [(p[0], p[1]) for p in track.points[frame_idx]]
-        all_labels = [p[2] for p in track.points[frame_idx]]
+        all_pts, all_labels = build_prompt_arrays(existing)
 
         # 伝播後に inference_state が解放されている場合は、
         # 動画全体を再ロードせず image_predictor で当該フレームのみ更新する
@@ -3589,46 +3656,147 @@ class MainWindow(QMainWindow):
         if self.sam2.inference_state is None:
             frame_bgr = self.video.get_frame(frame_idx)
             if frame_bgr is None:
-                track.points[frame_idx].pop()
+                del existing[len(existing) - len(added):]
                 self.statusBar().showMessage("フレーム取得に失敗しました")
-                return
+                return False
             # 既存の伝播マスクをヒントとして渡し、そこへ追加/削除する形で再生成
             prev = self.all_masks.get(track.track_id, {}).get(frame_idx)
+            boxes = extract_boxes(existing)
             mask = self.sam2.segment_single_frame(
-                frame_bgr, points=all_pts, labels=all_labels, prev_mask=prev
+                frame_bgr,
+                points=[p for p, l in zip(all_pts, all_labels) if l in (0, 1)] or None,
+                labels=[l for l in all_labels if l in (0, 1)] or None,
+                box=list(boxes[-1]) if boxes else None,
+                prev_mask=prev,
             )
         else:
             mask = self.sam2.add_points(
                 frame_idx, track.track_id, all_pts, all_labels
             )
+            # 伝播済みの inference_state に後からトラックを足した直後などは、
+            # 追加したばかりのオブジェクトが空のマスクで返ることがある。
+            # その場で見た目が消えてしまうので、単一フレーム推論で補う。
+            # （伝播すれば正しくなるが、即時のフィードバックが要る）
+            if label and (mask is None or not mask.any()):
+                frame_bgr = self.video.get_frame(frame_idx)
+                if frame_bgr is not None:
+                    boxes = extract_boxes(existing)
+                    fallback = self.sam2.segment_single_frame(
+                        frame_bgr,
+                        points=[pt for pt, lb in zip(all_pts, all_labels)
+                                if lb in (0, 1)] or None,
+                        labels=[lb for lb in all_labels if lb in (0, 1)] or None,
+                        box=list(boxes[-1]) if boxes else None,
+                        prev_mask=self.all_masks.get(
+                            track.track_id, {}).get(frame_idx),
+                    )
+                    if fallback is not None and fallback.any():
+                        mask = fallback
 
         if mask is None:
-            # 追加した履歴を戻す
-            track.points[frame_idx].pop()
+            # 追加した分を戻す
+            del existing[len(existing) - len(added):]
             self.statusBar().showMessage(
-                "ポイント追加に失敗しました（SAM2 状態を確認してください）"
+                "プロンプトの追加に失敗しました（SAM2 状態を確認してください）"
             )
+            return False
+
+        self._commit_undo(snap)
+        track.masks[frame_idx] = mask
+        self.all_masks.setdefault(track.track_id, {})[frame_idx] = mask
+
+        # この変更が反映されるのは今のフレームだけ。
+        # 他フレームに伝播済みのマスクがあるなら再伝播が要ることを伝える。
+        self._update_points_dirty()
+        self._refresh_display()
+        return True
+
+    def _on_point_clicked(self, x, y, label):
+        """ビューポートでポイントがクリックされた"""
+        track = self._current_track_for_prompt()
+        if track is None:
+            return
+        frame_idx = self.state.current_frame
+        undo_label = "ポイント追加" if label == 1 else "ネガティブポイント追加"
+
+        if not self._apply_prompt(track, frame_idx, [(x, y, label)],
+                                  label, undo_label):
             return
 
-        if mask is not None:
-            self._commit_undo(snap)
-            track.masks[frame_idx] = mask
-            self.all_masks[track.track_id][frame_idx] = mask
+        label_str = "ポジティブ" if label == 1 else "ネガティブ"
+        msg = (f"ポイント追加: {track.name} @ フレーム {frame_idx}  "
+               f"座標: ({x:.0f}, {y:.0f})  [{label_str}]")
+        # 範囲プロンプトは「対象の外接矩形」なので、その外のポジティブ点は
+        # SAM に無視される。別の対象を足したいなら別トラックにしてもらう。
+        if label == 1:
+            boxes = extract_boxes(track.points.get(frame_idx, []))
+            if boxes and not (boxes[-1][0] <= x <= boxes[-1][2]
+                              and boxes[-1][1] <= y <= boxes[-1][3]):
+                msg += ("　※ 範囲の外は反映されません。"
+                        "別の対象は「＋ 追加」で別トラックにしてください")
+        if self._points_dirty:
+            msg += "　→ 全フレームに反映するには「⟲ ポイントを反映」を押してください"
+        self.statusBar().showMessage(msg)
+        logger.info(msg)
 
-            # このポイントが反映されるのは今のフレームだけ。
-            # 他フレームに伝播済みのマスクがあるなら再伝播が要ることを伝える。
-            self._update_points_dirty()
+    def _on_box_selected(self, x0, y0, x1, y1, positive):
+        """ビューポートで範囲がドラッグ選択された
 
-            self._refresh_display()
-            label_str = "ポジティブ" if label == 1 else "ネガティブ"
-            msg = (f"ポイント追加: {track.name} @ フレーム {frame_idx}  "
-                   f"座標: ({x:.0f}, {y:.0f})  [{label_str}]")
-            if self._points_dirty:
-                msg += "　→ 全フレームに反映するには「⟲ ポイントを反映」を押してください"
-            self.statusBar().showMessage(msg)
-            # CLIで使う座標をコンソールにも出力
-            logger.info(msg)
-            logger.info(f"  → CLI用: --points \"{x:.0f},{y:.0f}\"")
+        追加（positive=1）は SAM2 のボックスプロンプトとして登録する。
+        人物以外のもの（看板・カバンなど）を範囲で囲って選ぶのに向く。
+
+        除外（positive=0）は SAM2 にボックスの否定形が無いため、
+        範囲内に格子状のネガティブポイントを置いて表現する。
+        """
+        track = self._current_track_for_prompt()
+        if track is None:
+            return
+        frame_idx = self.state.current_frame
+
+        # 画面外にはみ出した分を切り詰める
+        w, h = self.state.width, self.state.height
+        x0, x1 = sorted((max(0.0, min(x0, w - 1)), max(0.0, min(x1, w - 1))))
+        y0, y1 = sorted((max(0.0, min(y0, h - 1)), max(0.0, min(y1, h - 1))))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            self.statusBar().showMessage("範囲が小さすぎます")
+            return
+
+        if positive:
+            # SAM2 はボックスを「ラベル 2 / 3 の 2 点」として扱う。
+            # 1 フレームに複数のボックスは想定されていないので、
+            # 既にあるものは差し替える。
+            pts = track.points.get(frame_idx, [])
+            kept = [p for p in pts
+                    if int(p[2]) not in (BOX_LABEL_TL, BOX_LABEL_BR)]
+            if len(kept) != len(pts):
+                track.points[frame_idx] = kept
+            entries = [(x0, y0, BOX_LABEL_TL), (x1, y1, BOX_LABEL_BR)]
+            undo_label = "範囲を追加"
+        else:
+            entries = [(px, py, 0)
+                       for px, py in self._grid_points(x0, y0, x1, y1)]
+            undo_label = "範囲を除外"
+
+        if not self._apply_prompt(track, frame_idx, entries, positive, undo_label):
+            return
+
+        kind = "追加" if positive else "除外"
+        msg = (f"範囲{kind}: {track.name} @ フレーム {frame_idx}  "
+               f"({x0:.0f}, {y0:.0f}) - ({x1:.0f}, {y1:.0f})")
+        if self._points_dirty:
+            msg += "　→ 全フレームに反映するには「⟲ ポイントを反映」を押してください"
+        self.statusBar().showMessage(msg)
+        logger.info(msg)
+
+    @staticmethod
+    def _grid_points(x0, y0, x1, y1, divisions=3):
+        """矩形の内部に格子状の点を配置する（範囲除外用）"""
+        pts = []
+        for i in range(1, divisions + 1):
+            for j in range(1, divisions + 1):
+                pts.append((x0 + (x1 - x0) * i / (divisions + 1),
+                            y0 + (y1 - y0) * j / (divisions + 1)))
+        return pts
 
     def _edit_store_size(self):
         """手動編集マスクの保持解像度
@@ -3724,8 +3892,7 @@ class MainWindow(QMainWindow):
                 if not pts_list:
                     continue
 
-                pts = [(p[0], p[1]) for p in pts_list]
-                lbls = [p[2] for p in pts_list]
+                entries = list(pts_list)
 
                 # そのフレームのポイントだけでは、他フレームから伝播してきた
                 # 範囲を説明できない。現在のマスクから代表点を補って、
@@ -3736,11 +3903,11 @@ class MainWindow(QMainWindow):
                     near = max(8.0, self.state.width * 0.02)
                     for ex, ey in sample_points_from_mask(seed):
                         # ユーザーが打った点の近くは重複なので入れない
-                        if all((ex - px) ** 2 + (ey - py) ** 2 > near ** 2
-                               for px, py in pts):
-                            pts.append((ex, ey))
-                            lbls.append(1)
+                        if all((ex - p[0]) ** 2 + (ey - p[1]) ** 2 > near ** 2
+                               for p in entries):
+                            entries.append((ex, ey, 1))
 
+                pts, lbls = build_prompt_arrays(entries)
                 self.sam2.add_points(frame_idx, track.track_id, pts, lbls)
         return True
 
@@ -4311,14 +4478,21 @@ class MainWindow(QMainWindow):
                         color.red(), color.green(), color.blue(), 120
                     ]
 
-            # ポイントを描画
+            # ポイントと範囲を描画
             for track in self.state.person_tracks:
-                if self.state.current_frame in track.points:
-                    for px, py, label in track.points[self.state.current_frame]:
-                        c = (0, 255, 0, 255) if label == 1 else (255, 0, 0, 255)
-                        cv2.circle(overlay_img, (int(px), int(py)), 6, c, -1)
-                        cv2.circle(overlay_img, (int(px), int(py)), 7,
-                                   (255, 255, 255, 255), 2)
+                pts_list = track.points.get(frame_idx)
+                if not pts_list:
+                    continue
+                for px, py, label in pts_list:
+                    if int(label) in (BOX_LABEL_TL, BOX_LABEL_BR):
+                        continue        # ボックスは下でまとめて矩形として描く
+                    c = (0, 255, 0, 255) if label == 1 else (255, 0, 0, 255)
+                    cv2.circle(overlay_img, (int(px), int(py)), 6, c, -1)
+                    cv2.circle(overlay_img, (int(px), int(py)), 7,
+                               (255, 255, 255, 255), 2)
+                for bx0, by0, bx1, by1 in extract_boxes(pts_list):
+                    cv2.rectangle(overlay_img, (int(bx0), int(by0)),
+                                  (int(bx1), int(by1)), (0, 255, 0, 255), 2)
 
             qimg_overlay = QImage(
                 overlay_img.data, w, h, w * 4, QImage.Format.Format_RGBA8888
@@ -4817,6 +4991,27 @@ class MainWindow(QMainWindow):
             "同じく「⟲ ポイントを反映」を押してください。\n\n"
             "ブラシ (B) は 1 フレームだけを直す用途です。\n"
             "複数フレームに効かせたいときはポイントを使ってください。"
+        )
+
+    def _show_box_help(self):
+        """範囲選択の使い方を案内する"""
+        QMessageBox.information(
+            self, "範囲で選ぶ / 除く",
+            "人物以外のもの（看板・カバン・機材など）を選ぶときは、\n"
+            "範囲選択が手早く確実です。\n\n"
+            "■ 範囲で追加 (R)\n"
+            "  対象を囲むようにドラッグします。SAM2 のボックス指定として\n"
+            "  登録され、伝播でも範囲が保たれます。\n\n"
+            "■ 範囲で除外 (Shift+R)\n"
+            "  囲んだ範囲の内側に除外ポイントを並べて置きます。\n"
+            "  マスクから外したい部分をドラッグしてください。\n\n"
+            "■ 複数の対象を選びたいとき\n"
+            "  1 つのトラックに対して指定できる範囲は 1 つだけです。\n"
+            "  範囲の外にポジティブポイントを打っても反映されません\n"
+            "  （SAM2 では範囲が「対象の外接矩形」を意味するためです）。\n\n"
+            "  人物と看板のように離れた対象を両方ぼかさずに残したい場合は、\n"
+            "  「＋ 追加」で対象ごとにトラックを分けてください。\n"
+            "  書き出し時には全トラックのマスクが合成されます。"
         )
 
     def _show_about(self):
