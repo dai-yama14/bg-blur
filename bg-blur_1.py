@@ -408,6 +408,42 @@ def blend_blur(frame, mask_float, blur_type, strength, buf=None, blender=None):
     return buf.astype(np.uint8)
 
 
+def sample_points_from_mask(mask, max_points=6, min_area_ratio=0.001):
+    """マスクの各領域から、輪郭からいちばん遠い点を 1 つずつ拾う
+
+    伝播前にポイントを再登録するとき、そのフレームに打たれたポイント
+    だけでは「他フレームから伝播してきた範囲」を説明できない。
+    たとえば 0 フレーム目で人物を選び、1 フレーム目で小物を 1 点足した場合、
+    1 フレーム目のプロンプトはその 1 点だけになり、人物が丸ごと失われる。
+    そこで現在のマスクから代表点を補い、範囲の根拠を渡す。
+
+    距離変換の最大点を使うので、細い領域でも必ず内部の点になる。
+    戻り値は [(x, y), ...]（mask と同じ座標系）。
+    """
+    if mask is None:
+        return []
+    m = np.ascontiguousarray(mask.astype(np.uint8))
+    if not m.any():
+        return []
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    min_area = max(16.0, m.shape[0] * m.shape[1] * min_area_ratio)
+    comps = [
+        (int(stats[i, cv2.CC_STAT_AREA]), i)
+        for i in range(1, num)
+        if stats[i, cv2.CC_STAT_AREA] >= min_area
+    ]
+    comps.sort(reverse=True)
+
+    points = []
+    for _area, idx in comps[:max_points]:
+        dist = cv2.distanceTransform(
+            (labels == idx).astype(np.uint8), cv2.DIST_L2, 3)
+        _minv, _maxv, _minloc, maxloc = cv2.minMaxLoc(dist)
+        points.append((float(maxloc[0]), float(maxloc[1])))
+    return points
+
+
 def _downscale_mask_for_storage(mask, scale=MASK_STORE_SCALE):
     if mask is None or scale >= 1.0:
         return mask
@@ -3682,11 +3718,29 @@ class MainWindow(QMainWindow):
         if not self.sam2.init_video(self._frames_dir, frame_offset=offset):
             return False
         for track in self.state.person_tracks:
-            for frame_idx, pts_list in track.points.items():
+            frames = self.all_masks.get(track.track_id, {})
+            for frame_idx in sorted(track.points):
+                pts_list = track.points[frame_idx]
                 if not pts_list:
                     continue
+
                 pts = [(p[0], p[1]) for p in pts_list]
                 lbls = [p[2] for p in pts_list]
+
+                # そのフレームのポイントだけでは、他フレームから伝播してきた
+                # 範囲を説明できない。現在のマスクから代表点を補って、
+                # 「今見えている範囲」を維持したまま修正が効くようにする。
+                existing = frames.get(frame_idx)
+                if existing is not None and existing.any():
+                    seed = _to_size(existing, self.state.width, self.state.height)
+                    near = max(8.0, self.state.width * 0.02)
+                    for ex, ey in sample_points_from_mask(seed):
+                        # ユーザーが打った点の近くは重複なので入れない
+                        if all((ex - px) ** 2 + (ey - py) ** 2 > near ** 2
+                               for px, py in pts):
+                            pts.append((ex, ey))
+                            lbls.append(1)
+
                 self.sam2.add_points(frame_idx, track.track_id, pts, lbls)
         return True
 
