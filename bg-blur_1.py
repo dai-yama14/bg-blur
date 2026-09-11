@@ -17,7 +17,7 @@ import os
 
 # ── PyQt6 imports ──────────────────────────────────────────────────────────
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QDialog,
     QLabel, QPushButton, QSlider, QFileDialog, QStatusBar, QToolBar,
     QDockWidget, QListWidget, QListWidgetItem, QSpinBox, QComboBox,
     QProgressBar, QGroupBox, QCheckBox, QSplitter, QMessageBox,
@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsPixmapItem, QStyle, QListView, QRubberBand
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF, QSize, QRect
+    Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF, QSize, QRect,
+    QObject, QEvent, QPoint
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QColor, QBrush, QAction,
@@ -1716,6 +1717,103 @@ class ExportThread(QThread):
 # カスタムビューポート（フレーム表示 + インタラクション）
 # ══════════════════════════════════════════════════════════════════════════════
 
+class DialogPositioner(QObject):
+    """ダイアログをメインウィンドウのメニューバー直下に出す
+
+    既定ではウィンドウマネージャが位置を決めるため、確認ダイアログが
+    画面のあちこちに出てしまう。アプリ全体のイベントフィルタで
+    表示直前に捕まえ、毎回同じ位置へ移動させる。
+
+    画面外へはみ出す場合は、見えている範囲へ収める。
+    """
+
+    # メニューバーとの間隔。ウィンドウマネージャがタイトルバーのぶん
+    # (実測 27px) 下げるため、ここは 0 でも見た目には余白がつく。
+    TOP_MARGIN = 0
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+
+    PLACE_FLAG = "_vbs_place"
+
+    def eventFilter(self, obj, event):
+        if not isinstance(obj, QDialog):
+            return super().eventFilter(obj, event)
+
+        etype = event.type()
+        if etype == QEvent.Type.Show:
+            # QDialog は表示時に adjustPosition() で親の中央へ寄せ直す。
+            # WA_Moved を立てておくと「位置は指定済み」とみなされ、
+            # その自動配置が行われなくなる。
+            obj.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
+            obj.setProperty(self.PLACE_FLAG, True)
+            self._place(obj)
+            # レイアウト確定やウィンドウマネージャの配置は後から入る。
+            # 本文が長いメッセージボックスは大きさが決まるのも遅いので、
+            # 少し尾を長めにとって合わせ直す。
+            for delay in (0, 10, 30, 80, 160, 320):
+                QTimer.singleShot(delay, lambda d=obj: self._place(d))
+        elif etype == QEvent.Type.Resize and obj.property(self.PLACE_FLAG):
+            # 長い本文のメッセージボックスは表示後に大きさが決まる。
+            # 幅が変われば中央も変わるので、その都度合わせ直す。
+            QTimer.singleShot(0, lambda d=obj: self._place(d))
+        elif etype == QEvent.Type.Hide:
+            obj.setProperty(self.PLACE_FLAG, False)
+
+        return super().eventFilter(obj, event)
+
+    def _target_pos(self, dialog):
+        """ダイアログの枠の左上をどこに置きたいか（グローバル座標）"""
+        window = self._window
+        if window is None or not window.isVisible():
+            return None
+
+        # メニューバーの下端（ウィンドウ内のローカル座標）
+        bar = window.menuBar()
+        top = 0
+        if bar is not None and bar.isVisible():
+            top = bar.geometry().bottom() + 1
+        anchor = window.mapToGlobal(QPoint(0, top + self.TOP_MARGIN))
+
+        size = dialog.frameGeometry().size()
+        x = anchor.x() + (window.width() - size.width()) // 2
+        y = anchor.y()
+
+        # 画面からはみ出さないように収める
+        screen = dialog.screen() or window.screen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left(), min(x, area.right() - size.width()))
+            y = max(area.top(), min(y, area.bottom() - size.height()))
+        return x, y
+
+    def _place(self, dialog):
+        """狙った位置との差を測って詰める
+
+        move() をウィンドウの枠ではなくクライアント領域の位置として扱う
+        ウィンドウマネージャがあり、タイトルバーのぶんだけずれる。
+        実際の枠位置との差を見て、その分を引いて置き直す。
+        表示直後は数回呼ばれるので、これで収束する。
+        """
+        try:
+            if not dialog.isVisible():
+                return
+            target = self._target_pos(dialog)
+            if target is None:
+                return
+            x, y = target
+            frame = dialog.frameGeometry()
+            dx = frame.left() - x
+            dy = frame.top() - y
+            if dx == 0 and dy == 0:
+                return
+            pos = dialog.pos()
+            dialog.move(pos.x() - dx, pos.y() - dy)
+        except RuntimeError:
+            pass        # 既に破棄されている
+
+
 class SafeComboBox(QComboBox):
     """ドロップダウンが画面に残り続ける問題への対策付き QComboBox
 
@@ -2183,6 +2281,12 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_shortcuts()
         self._apply_stylesheet()
+
+        # 確認ダイアログをメニューバー直下に固定する
+        self._dialog_positioner = DialogPositioner(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._dialog_positioner)
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self._autosave_dir = os.path.join(base_dir, "autosave")
