@@ -1,0 +1,32 @@
+# ── モデル重み（Meta 配布。各自でダウンロードする）──
+checkpoints/
+*.pt
+*.pth
+
+# ── 入出力の動画 ──
+input/
+output/
+
+# ── プロジェクトの作業データ ──
+autosave/
+*.vbsproj
+*.vbsproj.npz
+*.npz
+
+# ── ローカル固有の設定・ログ ──
+.claude/settings.local.json
+error/
+*.log
+debug.log
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── エディタ / OS ──
+.vscode/
+.idea/
+.DS_Store
