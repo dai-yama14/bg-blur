@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
     QDockWidget, QListWidget, QListWidgetItem, QSpinBox, QComboBox,
     QProgressBar, QGroupBox, QCheckBox, QSplitter, QMessageBox,
     QScrollArea, QFrame, QToolButton, QMenu, QSizePolicy, QGraphicsView,
-    QGraphicsScene, QGraphicsPixmapItem, QStyle, QListView, QRubberBand
+    QGraphicsScene, QGraphicsPixmapItem, QStyle, QListView, QRubberBand,
+    QLineEdit
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QPointF, QRectF, QSize, QRect,
@@ -1814,6 +1815,79 @@ class DialogPositioner(QObject):
             pass        # 既に破棄されている
 
 
+class RenameDialog(QDialog):
+    """トラッキング対象の名前を変更する小さなダイアログ
+
+    リストの名前を右クリック →「名称変更」で開き、「完了」で確定する。
+    位置は DialogPositioner が他のダイアログと同じ場所へ寄せる。
+    """
+
+    MAX_LEN = 40
+
+    def __init__(self, parent, current_name):
+        super().__init__(parent)
+        self.setWindowTitle("名称変更")
+        self.setModal(True)
+        self.setStyleSheet("""
+            QDialog { background: #252525; }
+            QLabel { color: #ccc; font-size: 12px; }
+            QLineEdit {
+                background: #1e1e1e; border: 1px solid #555;
+                border-radius: 3px; color: #ddd; padding: 5px 6px;
+                selection-background-color: #0060aa;
+            }
+            QLineEdit:focus { border: 1px solid #0078d4; }
+            QPushButton {
+                background: #3a3a3a; border: 1px solid #555;
+                border-radius: 3px; color: #ddd; padding: 5px 16px;
+            }
+            QPushButton:hover { background: #4a4a4a; }
+            QPushButton:default {
+                background: #0060aa; border: 1px solid #0078d4;
+            }
+            QPushButton:default:hover { background: #0078d4; }
+            QPushButton:disabled { background: #303030; color: #777; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("新しい名前:"))
+
+        self.edit = QLineEdit(current_name)
+        self.edit.setMaxLength(self.MAX_LEN)
+        self.edit.selectAll()
+        self.edit.textChanged.connect(self._on_text_changed)
+        self.edit.returnPressed.connect(self._try_accept)
+        self.edit.setMinimumWidth(220)
+        layout.addWidget(self.edit)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.btn_cancel = QPushButton("キャンセル")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_done = QPushButton("完了")
+        self.btn_done.setDefault(True)
+        self.btn_done.clicked.connect(self._try_accept)
+        btn_row.addWidget(self.btn_cancel)
+        btn_row.addWidget(self.btn_done)
+        layout.addLayout(btn_row)
+
+        self.edit.setFocus()
+
+    def _on_text_changed(self, text):
+        # 空白だけの名前はリストで見分けがつかないので確定させない
+        self.btn_done.setEnabled(bool(text.strip()))
+
+    def _try_accept(self):
+        if self.name():
+            self.accept()
+
+    def name(self):
+        """入力された名前（前後の空白を落としたもの）"""
+        return self.edit.text().strip()
+
+
 class SafeComboBox(QComboBox):
     """ドロップダウンが画面に残り続ける問題への対策付き QComboBox
 
@@ -2511,7 +2585,15 @@ class MainWindow(QMainWindow):
             QListWidget::item { padding: 4px; }
             QListWidget::item:selected { background: #0060aa; }
         """)
+        self.person_list.setToolTip("右クリックで名称変更")
         self.person_list.currentRowChanged.connect(self._on_person_selected)
+        # 名前の上で右クリック →「名称変更」
+        self.person_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.person_list.customContextMenuRequested.connect(
+            self._show_person_menu
+        )
         person_layout.addWidget(self.person_list)
 
         btn_row = QHBoxLayout()
@@ -2733,12 +2815,14 @@ class MainWindow(QMainWindow):
                 return track
         return None
 
-    def _capture(self, label, mask_slots=(), edit_frames=(), roster=False):
+    def _capture(self, label, mask_slots=(), edit_frames=(), roster=False,
+                 name_ids=()):
         """指定スロットの現在値だけを抜き取ったスナップショットを作る。
 
         mask_slots : [(track_id, frame_idx), ...] マスクとポイントを対象にする
         edit_frames: [frame_idx, ...]             手動編集を対象にする
         roster     : True で人物リスト全体（ポイント・マスク込み）を対象にする
+        name_ids   : [track_id, ...] 名前だけを対象にする（マスクは触らない）
         値が無いスロットは None で記録し、復元時は「削除」として扱う。
         """
         snap = {
@@ -2746,11 +2830,19 @@ class MainWindow(QMainWindow):
             "masks": {},
             "points": {},
             "edits": {},
+            "names": {},
             "roster": None,
             "current_frame": self.state.current_frame,
             "nbytes": 0,
         }
         nbytes = 0
+
+        # 名前の変更は文字列 1 つで済むので、roster を丸ごと控えずに
+        # 名前だけを記録する（マスクを複製して履歴を膨らませない）
+        for tid in name_ids:
+            track = self._track_by_id(tid)
+            if track is not None:
+                snap["names"][tid] = track.name
 
         if roster:
             snap["roster"], nbytes = self._capture_roster()
@@ -2822,6 +2914,13 @@ class MainWindow(QMainWindow):
             self.state.person_tracks.append(track)
         self._rebuild_person_list()
 
+    def _refresh_person_names(self):
+        """リストの表示名だけを state に合わせ直す（選択行はそのまま）"""
+        for row, track in enumerate(self.state.person_tracks):
+            item = self.person_list.item(row)
+            if item is not None:
+                item.setText(f"● {track.name}")
+
     def _rebuild_person_list(self, select_row=None):
         """人物リストのウィジェットを state から作り直す"""
         self.person_list.blockSignals(True)
@@ -2837,10 +2936,11 @@ class MainWindow(QMainWindow):
             self.person_list.setCurrentRow(row)
             self.current_track_id = self.state.person_tracks[row].track_id
 
-    def _push_undo(self, label, mask_slots=(), edit_frames=(), roster=False):
+    def _push_undo(self, label, mask_slots=(), edit_frames=(), roster=False,
+                   name_ids=()):
         """操作の「直前」に呼び、変更前の状態を履歴へ積む"""
         self._commit_undo(
-            self._capture(label, mask_slots, edit_frames, roster)
+            self._capture(label, mask_slots, edit_frames, roster, name_ids)
         )
 
     def _commit_undo(self, snap):
@@ -2868,6 +2968,7 @@ class MainWindow(QMainWindow):
             mask_slots=list(snap["masks"].keys()),
             edit_frames=list(snap["edits"].keys()),
             roster=snap["roster"] is not None,
+            name_ids=list(snap.get("names", {}).keys()),
         )
 
         if snap["roster"] is not None:
@@ -2901,6 +3002,14 @@ class MainWindow(QMainWindow):
                 self.state.manual_edits.pop(frame_idx, None)
             else:
                 self.state.manual_edits[frame_idx] = mask
+
+        names = snap.get("names") or {}
+        for tid, name in names.items():
+            track = self._track_by_id(tid)
+            if track is not None:
+                track.name = name
+        if names:
+            self._refresh_person_names()
 
         return inverse
 
@@ -3717,6 +3826,43 @@ class MainWindow(QMainWindow):
     def _on_person_selected(self, row):
         if row >= 0 and row < len(self.state.person_tracks):
             self.current_track_id = self.state.person_tracks[row].track_id
+
+    def _show_person_menu(self, pos):
+        """リストの右クリックメニュー（名前の上でのみ出す）"""
+        item = self.person_list.itemAt(pos)
+        if item is None:
+            return
+        row = self.person_list.row(item)
+        if not (0 <= row < len(self.state.person_tracks)):
+            return
+        # メニューの操作は「右クリックした行」に対して行う
+        self.person_list.setCurrentRow(row)
+
+        menu = QMenu(self.person_list)
+        act_rename = menu.addAction("名称変更")
+        chosen = menu.exec(self.person_list.mapToGlobal(pos))
+        if chosen is act_rename:
+            self._rename_person(row)
+
+    def _rename_person(self, row):
+        """「名称変更」ダイアログを開き、「完了」で名前を確定する"""
+        if not (0 <= row < len(self.state.person_tracks)):
+            return
+        track = self.state.person_tracks[row]
+        dialog = RenameDialog(self, track.name)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_name = dialog.name()
+        if not new_name or new_name == track.name:
+            return
+
+        old_name = track.name
+        self._push_undo("名称の変更", name_ids=[track.track_id])
+        track.name = new_name
+        self._refresh_person_names()
+        self.statusBar().showMessage(
+            f"「{old_name}」を「{new_name}」に変更しました"
+        )
 
     def _current_track_for_prompt(self):
         """プロンプトを追加できる状態か確かめ、対象トラックを返す"""
