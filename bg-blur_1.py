@@ -10,6 +10,7 @@ Requirements:
   - sam2 (Meta SAM 2.1)
   - opencv-python
   - numpy
+  - ffmpeg (書き出しに音声を載せるために使用。無ければ映像のみ)
 """
 
 import sys
@@ -41,6 +42,7 @@ import json
 import time
 import gc
 import shutil
+import subprocess
 import logging
 import threading
 from collections import OrderedDict
@@ -156,6 +158,7 @@ class ProjectState:
     person_tracks: list = field(default_factory=list)
     manual_edits: dict = field(default_factory=dict)  # {frame_idx: np.ndarray}
     auto_save_enabled: bool = True
+    include_audio: bool = True    # 書き出しに元動画の音声を載せる
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1517,6 +1520,141 @@ class VideoHandler:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 音声の引き継ぎ (ffmpeg)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# OpenCV の VideoWriter は映像しか書けないため、書き出した映像に
+# 元動画の音声を ffmpeg で多重化して戻す。映像は再エンコードせず
+# コピーするので、長尺でも数秒で終わる。
+
+_FFMPEG_CACHE = {}
+
+
+def _find_tool(name):
+    """ffmpeg / ffprobe の場所を返す（見つからなければ None）"""
+    if name in _FFMPEG_CACHE:
+        return _FFMPEG_CACHE[name]
+    path = shutil.which(name)
+    if path is None:
+        # PATH に無い環境向けに、imageio が同梱する ffmpeg も見にいく
+        if name == "ffmpeg":
+            try:
+                import imageio_ffmpeg
+                path = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                path = None
+    _FFMPEG_CACHE[name] = path
+    return path
+
+
+def ffmpeg_available():
+    return _find_tool("ffmpeg") is not None
+
+
+def has_audio_stream(path):
+    """動画に音声トラックがあるか。判定できなければ None を返す"""
+    probe = _find_tool("ffprobe")
+    if probe is None or not path or not os.path.exists(path):
+        return None
+    try:
+        res = subprocess.run(
+            [probe, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        logger.warning(f"ffprobe の実行に失敗: {e}")
+        return None
+    if res.returncode != 0:
+        return None
+    return bool(res.stdout.strip())
+
+
+# 音声の入れ方を優先度順に試す。
+# まずは再エンコードなしのコピー。コンテナが受け付けない場合
+# (例: AVI に AAC) のために、エンコードし直す手も用意しておく。
+_AUDIO_CODEC_ATTEMPTS = (
+    ["-c:a", "copy"],
+    ["-c:a", "aac", "-b:a", "192k"],
+    ["-c:a", "libmp3lame", "-b:a", "192k"],
+)
+
+
+def mux_audio(video_path, source_path, timeout=1800):
+    """書き出した映像 (video_path) に source_path の音声を移す。
+
+    映像はコピーのみで再エンコードしない。成功したら video_path を
+    音声つきのものへ置き換える。
+
+    戻り値: (成功したか, 画面に出すメッセージ)
+    """
+    if not video_path or not os.path.exists(video_path):
+        return False, "書き出したファイルが見つかりません"
+    if not source_path or not os.path.exists(source_path):
+        return False, "元動画が見つからないため音声を取り込めません"
+
+    ffmpeg = _find_tool("ffmpeg")
+    if ffmpeg is None:
+        return False, "ffmpeg が見つからないため映像のみ書き出しました"
+
+    if has_audio_stream(source_path) is False:
+        return False, "元動画に音声がありません"
+
+    dst = Path(video_path)
+    tmp_path = str(dst.with_name(f"{dst.stem}.__audio__{dst.suffix}"))
+
+    last_err = ""
+    for codec_args in _AUDIO_CODEC_ATTEMPTS:
+        cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", video_path,            # 0: ぼかし済みの映像
+            "-i", source_path,           # 1: 元動画（音声の取り出し元）
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", *codec_args,
+            # 映像と音声で長さが違っても、短い方に合わせて切る
+            "-shortest",
+            tmp_path,
+        ]
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            _remove_quietly(tmp_path)
+            return False, "音声の取り込みがタイムアウトしました"
+        except Exception as e:
+            _remove_quietly(tmp_path)
+            return False, f"ffmpeg を実行できませんでした: {e}"
+
+        if res.returncode == 0 and os.path.exists(tmp_path) and \
+                os.path.getsize(tmp_path) > 0:
+            try:
+                os.replace(tmp_path, video_path)
+            except OSError as e:
+                _remove_quietly(tmp_path)
+                return False, f"音声つきファイルへの差し替えに失敗: {e}"
+            note = "" if codec_args[1] == "copy" else f"（{codec_args[1]} で再エンコード）"
+            message = f"音声を取り込みました{note}"
+            logger.info(message)
+            return True, message
+
+        last_err = (res.stderr or "").strip().splitlines()
+        last_err = last_err[-1] if last_err else f"ffmpeg 終了コード {res.returncode}"
+        logger.warning(f"音声の取り込みに失敗 ({codec_args[1]}): {last_err}")
+        _remove_quietly(tmp_path)
+
+    return False, f"音声を取り込めませんでした: {last_err}"
+
+
+def _remove_quietly(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 処理スレッド
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1624,6 +1762,7 @@ class ExportThread(QThread):
     4K でも巨大な二値マスクを持ち回らずに済む。
     """
     progress = pyqtSignal(int, int)
+    stage = pyqtSignal(str)             # ステータスバーに出す進行状況
     finished_signal = pyqtSignal(bool, str)
 
     def __init__(self, video_handler, state, all_masks, output_path, blender=None):
@@ -1636,6 +1775,9 @@ class ExportThread(QThread):
         # GPU 処理系は呼び出し側と共有する（CUDA コンテキストの作り直しを避ける）
         self._blender = blender
         self._owns_blender = blender is None
+        # 音声の取り込み結果。呼び出し側が完了通知に添えて表示する
+        self.audio_ok = False
+        self.audio_message = ""
 
     def run(self):
         cap = None
@@ -1688,6 +1830,14 @@ class ExportThread(QThread):
 
             out.release()
             out = None
+
+            # 映像だけの書き出しが終わったので、元動画の音声を移す
+            if self.state.include_audio:
+                self.stage.emit("音声を取り込み中...")
+                self.audio_ok, self.audio_message = mux_audio(
+                    self.output_path, self.state.video_path
+                )
+
             self.finished_signal.emit(True, self.output_path)
         except Exception as e:
             logger.error(f"エクスポートエラー: {e}")
@@ -2396,6 +2546,17 @@ class MainWindow(QMainWindow):
 
         act_split_process = file_menu.addAction("分割して処理 (長尺動画向け)(&P)")
         act_split_process.triggered.connect(self._split_and_process_video)
+
+        self.act_include_audio = file_menu.addAction("音声を含めて書き出す(&A)")
+        self.act_include_audio.setCheckable(True)
+        self.act_include_audio.setChecked(self.state.include_audio)
+        self.act_include_audio.triggered.connect(self._on_include_audio_toggled)
+        if not ffmpeg_available():
+            # ffmpeg が無い環境では音声を載せられないので、理由を添えて落としておく
+            self.act_include_audio.setChecked(False)
+            self.act_include_audio.setEnabled(False)
+            self.act_include_audio.setText("音声を含めて書き出す — ffmpeg 未検出(&A)")
+            self.state.include_audio = False
 
         file_menu.addSeparator()
         act_save_proj = file_menu.addAction("プロジェクト保存(&S)")
@@ -3602,10 +3763,12 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()
                 final_out.release()
 
+                audio_note = self._audio_note(self._mux_audio_into(output_path))
+
                 QMessageBox.information(
                     self, "完了",
                     f"分割処理が完了しました:\n\n{output_path}\n\n"
-                    f"{len(part_files)} 区間を結合"
+                    f"{len(part_files)} 区間を結合{audio_note}"
                 )
                 self.statusBar().showMessage(f"分割処理完了: {output_path}")
 
@@ -4765,6 +4928,13 @@ class MainWindow(QMainWindow):
         return blend_blur(frame, mask_float, self.state.blur_type,
                           self.state.blur_strength, blender=self._blender)
 
+    def _on_include_audio_toggled(self, checked):
+        self.state.include_audio = bool(checked)
+        self.statusBar().showMessage(
+            "書き出しに元動画の音声を含めます" if checked
+            else "書き出しは映像のみになります"
+        )
+
     def _export_video(self):
         """ぼかし適用済みビデオをエクスポート"""
         if not self.state.video_path:
@@ -4788,6 +4958,7 @@ class MainWindow(QMainWindow):
         self._export_thread.progress.connect(
             lambda i, t: self.progress_bar.setValue(i)
         )
+        self._export_thread.stage.connect(self.statusBar().showMessage)
         self._export_thread.finished_signal.connect(self._on_export_done)
         self._export_thread.start()
         self.statusBar().showMessage("エクスポート中...")
@@ -4797,13 +4968,39 @@ class MainWindow(QMainWindow):
         # スレッド自身のシグナル処理中に破棄すると危ないので次のループで片付ける
         QTimer.singleShot(0, self._cleanup_after_export)
         if success:
+            # 音声の結果はスレッドが持っている。
+            # 後始末（_cleanup_after_export）より先に読み出しておく
+            thread = getattr(self, "_export_thread", None)
+            note = self._audio_note(getattr(thread, "audio_message", ""))
             QMessageBox.information(
                 self, "完了",
-                f"エクスポートが完了しました:\n{result}"
+                f"エクスポートが完了しました:\n{result}{note}"
             )
             self.statusBar().showMessage(f"エクスポート完了: {result}")
         else:
             QMessageBox.critical(self, "エラー", f"エクスポートに失敗: {result}")
+
+    def _audio_note(self, message):
+        """完了ダイアログに添える音声の結果（無ければ空文字）"""
+        if not self.state.include_audio:
+            return "\n\n音声: 含めない設定のため映像のみです"
+        return f"\n\n音声: {message}" if message else ""
+
+    def _mux_audio_into(self, output_path):
+        """書き出したファイルへ元動画の音声を移す（GUI スレッド用）
+
+        ExportThread と違ってこちらは同期実行なので、
+        待っている間もステータスバーと画面が更新されるようにする。
+        戻り値は完了ダイアログに添えるメッセージ。
+        """
+        if not self.state.include_audio:
+            return ""
+        self.statusBar().showMessage("音声を取り込み中...")
+        QApplication.processEvents()
+        ok, message = mux_audio(output_path, self.state.video_path)
+        if not ok:
+            logger.warning(f"音声の取り込み: {message}")
+        return message
 
     def _cleanup_after_export(self):
         """エクスポート後の後始末（スレッドと一時バッファの解放）"""
@@ -4913,11 +5110,13 @@ class MainWindow(QMainWindow):
                 cap.release()
             final_out.release()
 
+            audio_note = self._audio_note(self._mux_audio_into(output_path))
+
             self.progress_bar.setVisible(False)
             QMessageBox.information(
                 self, "完了",
                 f"分割エクスポートが完了しました:\n{output_path}\n\n"
-                f"{num_segments}セグメントを結合"
+                f"{num_segments}セグメントを結合{audio_note}"
             )
             self.statusBar().showMessage(f"エクスポート完了: {output_path}")
 
@@ -4947,6 +5146,7 @@ class MainWindow(QMainWindow):
                 "blur_strength": self.state.blur_strength,
                 "blur_type": self.state.blur_type,
                 "edge_feather": self.state.edge_feather,
+                "include_audio": self.state.include_audio,
                 "width": self.state.width,
                 "height": self.state.height,
                 "source_width": self.state.source_width,
@@ -5030,6 +5230,9 @@ class MainWindow(QMainWindow):
             self.state.blur_strength = data.get("blur_strength", 25)
             self.state.blur_type = data.get("blur_type", "gaussian")
             self.state.edge_feather = data.get("edge_feather", 5)
+            if self.act_include_audio.isEnabled():
+                self.state.include_audio = bool(data.get("include_audio", True))
+                self.act_include_audio.setChecked(self.state.include_audio)
 
             self.blur_slider.setValue(self.state.blur_strength)
             self.blur_spin.setValue(self.state.blur_strength)
@@ -5278,6 +5481,7 @@ class MainWindow(QMainWindow):
             "<li>手動でマスク修正（ブラシ / 消しゴム）</li>"
             "<li>ぼかし強度・タイプ・エッジフェザリングの細かい調整</li>"
             "<li>リアルタイムプレビュー</li>"
+            "<li>元動画の音声を引き継いで書き出し（ffmpeg）</li>"
             "</ul>"
             "<hr>"
             "<p>Powered by Meta SAM 2.1 + PyQt6</p>"

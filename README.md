@@ -13,12 +13,14 @@ SAM2（Segment Anything Model 2）で人物をセグメンテーションし、�
 - **プロキシ編集** — UHD/4K は FHD に縮小して編集し、エクスポート時に元解像度へ戻す
 - **GPU アクセラレーション** — ぼかしと合成を PyTorch で GPU 処理（CUDA が無ければ自動で CPU）
 - **長尺動画の分割処理** — 区間ごとに処理して結合（メモリ使用量を一定に抑える）
+- **音声の引き継ぎ** — 書き出した映像に元動画の音声を ffmpeg で戻す（映像は再エンコードしない）
 - **自動保存** — 5 分ごと、および終了時に保存。次回同じ動画を開くと復帰を提案
 
 ## 動作環境
 
 - Python 3.10 以上（3.11 で動作確認）
 - NVIDIA GPU + CUDA（CPU でも動作しますが実用的な速度が出ません）
+- ffmpeg（音声を書き出すために使用。無い場合は映像のみ書き出します）
 - 開発・確認環境: RTX 5080 / CUDA 12.8 / PyTorch 2.10 / Ubuntu 24.04 (WSL2)
 
 ## セットアップ
@@ -31,6 +33,9 @@ conda activate vbs
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install PyQt6 opencv-python numpy pyyaml omegaconf hydra-core
 ```
+
+音声つきで書き出すには ffmpeg が必要です（Ubuntu なら `sudo apt install ffmpeg`）。
+
 
 ### 2. SAM2
 
@@ -73,6 +78,10 @@ python bg-blur_1.py
 4. 「▶ 全フレーム伝播」
 5. 小物が外れていたら、そのフレームでクリックしてから「⟲ ポイントを反映」
 6. 「ファイル → エクスポート」
+
+書き出したファイルには元動画の音声がそのまま入ります（映像は再エンコードせず、
+音声だけを ffmpeg で多重化するので数秒で終わります）。
+映像のみにしたいときは「ファイル → 音声を含めて書き出す」のチェックを外してください。
 
 ### ショートカット
 
